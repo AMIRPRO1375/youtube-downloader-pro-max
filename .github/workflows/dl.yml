@@ -1,0 +1,440 @@
+name: 01- 🎬 Youtube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+      quality:
+        description: 'Video quality (best, 1080, 720, 480, audio)'
+        required: false
+        default: 'best'
+        type: string
+      password:
+        description: 'Password for zip files (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download-youtube:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start WARP Container
+        run: |
+          echo "Starting Cloudflare WARP container..."
+
+          docker network create warp-net || true
+
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP to initialize (30 seconds)..."
+          sleep 30
+
+          echo "Checking WARP status..."
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              echo "$RESULT"
+              break
+            else
+              echo "Attempt $i/10 - WARP not ready yet, waiting..."
+              sleep 10
+            fi
+          done
+
+          FINAL=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+          if echo "$FINAL" | grep -qE "warp=(on|plus)"; then
+            echo "WARP proxy is ready!"
+          else
+            echo "WARP might not be fully active, but continuing anyway..."
+            echo "Response: $FINAL"
+          fi
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip curl jq bc
+          pip3 install --upgrade yt-dlp
+
+      - name: Download YouTube Video
+        run: |
+          URL="${{ github.event.inputs.youtube_url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          SPLIT_MB=90
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          mkdir -p videos tmp_downloads
+
+          echo "AVASAM YouTube Downloader"
+          echo "https://avasam.ir"
+          echo ""
+          echo "Downloading: $URL"
+          echo "Quality: $QUALITY"
+          if [ -n "$ZIP_PASSWORD" ]; then
+            echo "Password protection: ENABLED"
+          else
+            echo "Password protection: DISABLED"
+          fi
+
+          # Function for proper URL encoding
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          case "$QUALITY" in
+            "audio")
+              FORMAT="bestaudio"
+              ;;
+            "best")
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+              ;;
+            "1080")
+              FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+              ;;
+            "720")
+              FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+              ;;
+            "480")
+              FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
+              ;;
+            *)
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+              ;;
+          esac
+
+          yt-dlp \
+            --proxy "socks5://127.0.0.1:1080" \
+            --format "$FORMAT" \
+            --merge-output-format mp4 \
+            --output "tmp_downloads/%(title)s.%(ext)s" \
+            --no-playlist \
+            --retries 10 \
+            --fragment-retries 10 \
+            --concurrent-fragments 4 \
+            --no-check-certificates \
+            --prefer-free-formats \
+            --no-warnings \
+            "$URL" || {
+              echo "yt-dlp failed, trying alternative method..."
+
+              yt-dlp \
+                --proxy "socks5://127.0.0.1:1080" \
+                --format "$FORMAT" \
+                --merge-output-format mp4 \
+                --output "tmp_downloads/%(title)s.%(ext)s" \
+                --no-playlist \
+                --retries 10 \
+                --fragment-retries 10 \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --extractor-args "youtube:player_client=android" \
+                "$URL"
+            }
+
+          echo "Download complete!"
+          ls -la tmp_downloads/
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+
+          get_random_word() {
+            echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
+          }
+
+          get_unique_folder() {
+            local BASE_PATH="$1"
+            local NAME="$2"
+            if [ ! -d "$BASE_PATH/$NAME" ]; then
+              echo "$NAME"
+              return
+            fi
+            local RANDOM_SUFFIX=$(get_random_word)
+            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ]; do
+              RANDOM_SUFFIX=$(get_random_word)
+            done
+            echo "${NAME}_${RANDOM_SUFFIX}"
+          }
+
+          FILE_INDEX=0
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            FILE_INDEX=$((FILE_INDEX + 1))
+
+            echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+            FINAL_FOLDER_NAME=$(get_unique_folder "videos" "$FILENAME_NO_EXT")
+            mkdir -p "videos/${FINAL_FOLDER_NAME}"
+            echo "Created folder: videos/${FINAL_FOLDER_NAME}"
+
+            TEMP_NAME="video_${FILE_INDEX}"
+
+            if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "Splitting $BASENAME into ${SPLIT_MB}MB parts..."
+
+              cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+
+              cd tmp_downloads
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              else
+                zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              fi
+
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                if [ -f "$part" ]; then
+                  PART_EXT="${part##*.}"
+                  mv "$part" "../videos/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${PART_EXT}"
+                  echo "  Created: ${FINAL_FOLDER_NAME}.${PART_EXT}"
+                fi
+              done
+
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd ..
+
+              PART_COUNT=$(ls "videos/${FINAL_FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
+              echo "Created $PART_COUNT parts in videos/${FINAL_FOLDER_NAME}/"
+
+              TOTAL_SIZE=0
+              for part_file in "videos/${FINAL_FOLDER_NAME}"/*; do
+                if [ -f "$part_file" ]; then
+                  PART_SIZE=$(stat -c%s "$part_file")
+                  TOTAL_SIZE=$((TOTAL_SIZE + PART_SIZE))
+                fi
+              done
+              TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+
+              DOWNLOAD_LINKS_MD=""
+              FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+              LINK_NUM=0
+              for part_file in "videos/${FINAL_FOLDER_NAME}"/*.z*; do
+                if [ -f "$part_file" ]; then
+                  PART_BASENAME=$(basename "$part_file")
+                  PART_ENCODED=$(urlencode "${PART_BASENAME}")
+                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${PART_ENCODED}"
+                  LINK_NUM=$((LINK_NUM + 1))
+                  DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
+                fi
+              done
+
+              README_FILE="videos/${FINAL_FOLDER_NAME}/README.md"
+              {
+                printf '%s\n' "# ${FILENAME_NO_EXT}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Video Information"
+                printf '%s\n' ""
+                printf '%s\n' "| Property | Value |"
+                printf '%s\n' "|----------|-------|"
+                printf '%s\n' "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+                printf '%s\n' "| **Original Link** | [YouTube Video](${URL}) |"
+                printf '%s\n' "| **Total Size** | **${PART_COUNT} zip parts** - **${TOTAL_SIZE_MB} MB** |"
+                printf '%s\n' "| **Quality** | **${QUALITY}** |"
+                printf '%s\n' "| **Status** | **Complete (100%)** |"
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  printf '%s\n' "| **Password Protected** | **YES** |"
+                else
+                  printf '%s\n' "| **Password Protected** | **NO** |"
+                fi
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Links"
+                printf '%s\n' ""
+                printf '%s\n' "| # | File | Link |"
+                printf '%s\n' "|---|------|------|"
+                printf '%s' "${DOWNLOAD_LINKS_MD}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## How to Extract"
+                printf '%s\n' ""
+                printf '%s\n' "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
+                printf '%s\n' "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
+                printf '%s\n' "3. Open the \`.zip\` file - all parts will combine automatically"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "*This tool created by [avasam.ir](https://avasam.ir)*"
+              } > "$README_FILE"
+
+              echo "Created README.md in videos/${FINAL_FOLDER_NAME}/"
+
+            else
+              if [ -n "$ZIP_PASSWORD" ]; then
+                echo "$BASENAME - creating password-protected zip in folder: videos/${FINAL_FOLDER_NAME}"
+
+                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+
+                cd tmp_downloads
+                zip -j -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                mv "${TEMP_NAME}.zip" "../videos/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip"
+                rm -f "${TEMP_NAME}.${EXT}"
+                cd ..
+
+                SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+                FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+                FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.zip")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
+
+                README_FILE="videos/${FINAL_FOLDER_NAME}/README.md"
+                {
+                  printf '%s\n' "# ${FILENAME_NO_EXT}"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Video Information"
+                  printf '%s\n' ""
+                  printf '%s\n' "| Property | Value |"
+                  printf '%s\n' "|----------|-------|"
+                  printf '%s\n' "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+                  printf '%s\n' "| **Original Link** | [YouTube Video](${URL}) |"
+                  printf '%s\n' "| **Total Size** | **1 zip file** - **${SIZE_MB} MB** |"
+                  printf '%s\n' "| **Quality** | **${QUALITY}** |"
+                  printf '%s\n' "| **Status** | **Complete (100%)** |"
+                  printf '%s\n' "| **Password Protected** | **YES** |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Download Link"
+                  printf '%s\n' ""
+                  printf '%s\n' "| # | File | Link |"
+                  printf '%s\n' "|---|------|------|"
+                  printf '%s\n' "| 1 | \`${FINAL_FOLDER_NAME}.zip\` | [Download](${RAW_LINK}) |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "*This tool created by [avasam.ir](https://avasam.ir)*"
+                } > "$README_FILE"
+
+                echo "Created password-protected zip and README.md"
+
+              else
+                echo "$BASENAME - copying mp4 to folder: videos/${FINAL_FOLDER_NAME}"
+
+                cp "$FILE" "videos/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
+
+                SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+                FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+                FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.${EXT}")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
+
+                README_FILE="videos/${FINAL_FOLDER_NAME}/README.md"
+                {
+                  printf '%s\n' "# ${FILENAME_NO_EXT}"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Video Information"
+                  printf '%s\n' ""
+                  printf '%s\n' "| Property | Value |"
+                  printf '%s\n' "|----------|-------|"
+                  printf '%s\n' "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+                  printf '%s\n' "| **Original Link** | [YouTube Video](${URL}) |"
+                  printf '%s\n' "| **Total Size** | **1 file** (no split) - **${SIZE_MB} MB** |"
+                  printf '%s\n' "| **Quality** | **${QUALITY}** |"
+                  printf '%s\n' "| **Status** | **Complete (100%)** |"
+                  printf '%s\n' "| **Password Protected** | **NO** |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Download Link"
+                  printf '%s\n' ""
+                  printf '%s\n' "| # | File | Link |"
+                  printf '%s\n' "|---|------|------|"
+                  printf '%s\n' "| 1 | \`${FINAL_FOLDER_NAME}.${EXT}\` | [Download](${RAW_LINK}) |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "Ready to use - no extraction needed!"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "*This tool created by [avasam.ir](https://avasam.ir)*"
+                } > "$README_FILE"
+
+                echo "Copied mp4 and created README.md"
+              fi
+            fi
+          done
+          rm -rf tmp_downloads
+
+      - name: Stop WARP Container
+        if: always()
+        run: |
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          echo "AVASAM (https://avasam.ir) - Preparing to commit files"
+
+          if [ ! -d "videos" ] || [ -z "$(ls -A videos 2>/dev/null)" ]; then
+            echo "No files to commit in videos folder"
+            exit 1
+          fi
+
+          mapfile -t ALL_FILES < <(find videos -type f -name "*")
+
+          TOTAL=${#ALL_FILES[@]}
+          echo "Total files to push: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          BATCH_SIZE=5
+          BATCH_NUM=0
+
+          for (( i=0; i<TOTAL; i+=BATCH_SIZE )); do
+            BATCH_NUM=$(( BATCH_NUM + 1 ))
+            BATCH=("${ALL_FILES[@]:i:BATCH_SIZE}")
+
+            echo "Pushing batch $BATCH_NUM: files $((i+1)) to $(( i + ${#BATCH[@]} )) of $TOTAL"
+
+            git add "${BATCH[@]}"
+
+            if [ -n "$(git diff --cached --name-only)" ]; then
+              git commit -m "[AVASAM] YouTube download - batch $BATCH_NUM [skip ci]"
+              git pull --rebase origin "$BRANCH" || true
+              git push origin HEAD:"$BRANCH"
+              echo "Batch $BATCH_NUM pushed"
+            else
+              echo "Batch $BATCH_NUM skipped - no new changes"
+            fi
+          done
+
+          echo "All $TOTAL files pushed - AVASAM (https://avasam.ir)"
